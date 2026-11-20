@@ -1,0 +1,1100 @@
+
+
+========== .\autonomous_agent.py ==========
+
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from datetime import datetime
+from pathlib import Path
+
+import ollama
+
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+
+MODEL = "qwen3:8b"
+
+PROJECT_DIR = (
+    Path(__file__).resolve().parent
+    / "projects"
+    / "agent-test"
+).resolve()
+
+BACKUP_DIR = PROJECT_DIR / ".agent_backups"
+
+MAX_STEPS = 12
+MAX_FILE_SIZE = 50_000
+MAX_OUTPUT_SIZE = 10_000
+MAX_TIMEOUT = 60
+
+IGNORED_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    ".agent_backups",
+}
+
+
+# ==========================================
+# PROJECT SECURITY
+# ==========================================
+
+def safe_path(filename):
+    if not isinstance(filename, str) or not filename.strip():
+        raise ValueError("Invalid filename.")
+
+    path = (PROJECT_DIR / filename).resolve()
+
+    try:
+        path.relative_to(PROJECT_DIR)
+    except ValueErr
+    or:
+        raise ValueError("Access outside the project is forbidden.")
+
+    if path == PROJECT_DIR:
+        raise ValueError("Cannot operate on project root.")
+
+    if any(part in IGNORED_DIRS for part in path.relative_to(PROJECT_DIR).parts):
+        raise ValueError("Access to protected directories is forbidden.")
+
+    return path
+
+
+def approve(message):
+    print("\n" + message)
+
+    answer = input("Approve? (yes/no): ").strip().lower()
+
+    return answer in ("yes", "y")
+
+
+# ==========================================
+# FILE TOOLS
+# ==========================================
+
+def list_files():
+    results = []
+
+    for path in PROJECT_DIR.rglob("*"):
+
+        if any(part in IGNORED_DIRS for part in path.parts):
+            continue
+
+        if path.is_file():
+            results.append(
+                str(path.relative_to(PROJECT_DIR))
+            )
+
+        if len(results) >= 200:
+            break
+
+    return "\n".join(results) or "Project is empty."
+
+
+def read_file(filename):
+    path = safe_path(filename)
+
+    if not path.is_file():
+        raise ValueError("File does not exist.")
+
+    if path.stat().st_size > MAX_FILE_SIZE:
+        raise ValueError("File exceeds the read size limit.")
+
+    return path.read_text(
+        encoding="utf-8",
+        errors="replace"
+    )
+
+
+def create_file(filename, content):
+    path = safe_path(filename)
+
+    if not isinstance(content, str):
+        raise ValueError("Content must be text.")
+
+    if len(content.encode("utf-8")) > MAX_FILE_SIZE:
+        raise ValueError("File exceeds the size limit.")
+
+    if path.exists():
+        raise ValueError("File already exists. Use update_file.")
+
+    if not approve(
+        f"CREATE FILE: {path.relative_to(PROJECT_DIR)}\n"
+        f"Size: {len(content)} characters"
+    ):
+        return "Creation rejected by user."
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Exclusive creation prevents overwriting an existing file.
+    with path.open("x", encoding="utf-8", newline="\n") as file:
+        file.write(content)
+
+    return "File created successfully."
+
+
+def update_file(filename, content):
+    path = safe_path(filename)
+
+    if not path.is_file():
+        raise ValueError("File does not exist.")
+
+    if not isinstance(content, str):
+        raise ValueError("Content must be text.")
+
+    if len(content.encode("utf-8")) > MAX_FILE_SIZE:
+        raise ValueError("File exceeds the size limit.")
+
+    if not approve(
+        f"UPDATE FILE: {path.relative_to(PROJECT_DIR)}\n"
+        f"Size: {len(content)} characters"
+    ):
+        return "Update rejected by user."
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    backup_path = (
+        BACKUP_DIR
+        / timestamp
+        / path.relative_to(PROJECT_DIR)
+    )
+
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, backup_path)
+
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False
+        ) as temp_file:
+
+            temp_file.write(content)
+            temp_path = Path(temp_file.name)
+
+        os.replace(temp_path, path)
+
+    except Exception:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+        shutil.copy2(backup_path, path)
+        raise
+
+    return f"File updated. Backup: {backup_path.relative_to(PROJECT_DIR)}"
+
+
+# ==========================================
+# PYTHON EXECUTION TOOL
+# ==========================================
+
+def run_python(filename):
+    path = safe_path(filename)
+
+    if path.suffix.lower() != ".py":
+        raise ValueError("Only Python scripts can be executed.")
+
+    if not path.is_file():
+        raise ValueError("Python file does not exist.")
+
+    if not approve(
+        f"EXECUTE PYTHON FILE: {path.relative_to(PROJECT_DIR)}\n"
+        "This executes code on your Windows computer."
+    ):
+        return "Execution rejected by user."
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(path)],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=MAX_TIMEOUT,
+            shell=False
+        )
+
+        output = (
+            f"Exit code: {result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
+        )
+
+        return output[:MAX_OUTPUT_SIZE]
+
+    except subprocess.TimeoutExpired:
+        return f"Execution timed out after {MAX_TIMEOUT} seconds."
+
+
+# ==========================================
+# REGISTERED AI TOOLS
+# ==========================================
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files inside the current project.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read an existing project file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"}
+                },
+                "required": ["filename"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": "Create a new project file. Never overwrite.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["filename", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_file",
+            "description": "Replace an existing file after creating a backup.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["filename", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": "Run a Python script inside the current project after user approval.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"}
+                },
+                "required": ["filename"]
+            }
+        }
+    }
+]
+
+
+# ==========================================
+# TOOL DISPATCHER
+# ==========================================
+
+def execute_tool(name, arguments):
+
+    if not isinstance(arguments, dict):
+        return "Error: Tool arguments must be an object."
+
+    try:
+        if name == "list_files":
+            if arguments:
+                raise ValueError("No arguments expected.")
+
+            return list_files()
+
+        if name == "read_file":
+            return read_file(arguments["filename"])
+
+        if name == "create_file":
+            return create_file(
+                arguments["filename"],
+                arguments["content"]
+            )
+
+        if name == "update_file":
+            return update_file(
+                arguments["filename"],
+                arguments["content"]
+            )
+
+        if name == "run_python":
+            return run_python(arguments["filename"])
+
+        return f"Error: Unknown tool: {name}"
+
+    except Exception as error:
+        return f"Tool error: {type(error).__name__}: {error}"
+
+
+# ==========================================
+# AUTONOMOUS TOOL LOOP
+# ==========================================
+
+def run_agent(instruction):
+
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are a local software engineering agent.
+
+Your workspace is an isolated project directory.
+
+Your responsibilities:
+- Understand the user's requirements.
+- Inspect existing files before modifying them.
+- Create complete, working implementations.
+- Use tools to inspect and modify the project.
+- Run Python scripts when appropriate.
+- Read execution errors and fix problems.
+- Verify your work before declaring completion.
+
+Rules:
+- Never invent tool results.
+- Never claim tests passed without running them.
+- Never access files outside the project.
+- Do not overwrite files unnecessarily.
+- Do not create duplicate implementations.
+- Make small, logical changes.
+- Explain when you cannot complete a task.
+- User approval is required for file changes and execution.
+
+Use the available tools whenever filesystem operations are needed.
+"""
+        },
+        {
+            "role": "user",
+            "content": instruction
+        }
+    ]
+
+    total_calls = 0
+
+    for step in range(1, MAX_STEPS + 1):
+
+        print(f"\n{'=' * 45}")
+        print(f"AGENT STEP {step}/{MAX_STEPS}")
+        print("=" * 45)
+
+        response = ollama.chat(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            think=False,
+            options={
+                "temperature": 0,
+                "num_predict": 3000
+            }
+        )
+
+        message = response.message
+        messages.append(message)
+
+        tool_calls = message.tool_calls or []
+
+        if not tool_calls:
+            print("\nAI:")
+            print(message.content)
+            return
+
+        for call in tool_calls:
+
+            total_calls += 1
+
+            if total_calls > 20:
+                print("Maximum tool-call limit reached.")
+                return
+
+            name = call.function.name
+            arguments = call.function.arguments
+
+            print(f"\nTool requested: {name}")
+
+            result = execute_tool(name, arguments)
+
+            print("\nTool result:")
+            print(str(result)[:MAX_OUTPUT_SIZE])
+
+            messages.append({
+                "role": "tool",
+                "tool_name": name,
+                "content": str(result)
+            })
+
+    print("\nAgent stopped: maximum reasoning steps reached.")
+
+
+# ==========================================
+# APPLICATION ENTRY POINT
+# ==========================================
+
+def main():
+
+    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 45)
+    print("       AUTONOMOUS CODING AGENT")
+    print("=" * 45)
+
+    print(f"\nModel: {MODEL}")
+    print(f"Project: {PROJECT_DIR}")
+    print(f"Maximum steps: {MAX_STEPS}")
+
+    print("\nDescribe what you want the agent to build.")
+    print("Type /exit to quit.\n")
+
+    while True:
+
+        instruction = input("\nYou: ").strip()
+
+        if instruction.lower() in ("/exit", "exit"):
+            break
+
+        if not instruction:
+            continue
+
+        try:
+            run_agent(instruction)
+
+        except KeyboardInterrupt:
+            print("\nAgent interrupted by user.")
+
+        except Exception as error:
+            print(f"\nAgent error: {error}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+========== .\tools\computer.py ==========
+
+import math
+import subprocess
+import time
+from pathlib import Path
+
+import pyautogui
+
+# Emergency stop: move the mouse to the top-left corner.
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.3
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_screen_size():
+    """Return screen dimensions."""
+    width, height = pyautogui.size()
+    return {
+        "width": width,
+        "height": height
+    }
+
+
+def validate_coordinates(x, y):
+    """Ensure coordinates are inside the screen."""
+    width, height = pyautogui.size()
+
+    if (
+        not isinstance(x, int)
+        or isinstance(x, bool)
+        or not isinstance(y, int)
+        or isinstance(y, bool)
+    ):
+        raise TypeError("Coordinates must be integers.")
+
+    if not (0 <= x < width and 0 <= y < height):
+        raise ValueError(
+            f"Coordinates must be within 0-{width - 1}, "
+            f"0-{height - 1}."
+        )
+
+
+def validate_duration(duration, maximum=30):
+    finite = False
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        try:
+            finite = math.isfinite(duration)
+        except OverflowError:
+            pass
+
+    if (
+        not finite
+        or duration < 0
+        or duration > maximum
+    ):
+        raise ValueError(
+            f"Duration must be finite and between 0 and {maximum} seconds."
+        )
+
+
+def move_mouse(x: int, y: int, duration: float = 0.3):
+    """Move the cursor to the given coordinates."""
+    validate_coordinates(x, y)
+    validate_duration(duration)
+
+    pyautogui.moveTo(x, y, duration=duration)
+    return f"Mouse moved to ({x}, {y})."
+
+
+def click_mouse(x: int, y: int):
+    """Move to coordinates and click."""
+    move_mouse(x, y)
+    pyautogui.click()
+    return f"Clicked at ({x}, {y})."
+
+
+def right_click_mouse(x: int, y: int):
+    """Right-click at the given screen coordinates."""
+    validate_coordinates(x, y)
+    pyautogui.rightClick(x, y)
+    return f"Right-clicked at ({x}, {y})."
+
+
+def double_click_mouse(x: int, y: int):
+    """Double-click at the given screen coordinates."""
+    validate_coordinates(x, y)
+    pyautogui.doubleClick(x, y)
+    return f"Double-clicked at ({x}, {y})."
+
+
+def scroll_mouse(clicks: int, x=None, y=None):
+    """Scroll vertically; positive clicks scroll up and negative clicks down."""
+    if (
+        not isinstance(clicks, int)
+        or isinstance(clicks, bool)
+        or clicks == 0
+        or abs(clicks) > 50
+    ):
+        raise ValueError("Scroll clicks must be an integer from -50 to 50, excluding 0.")
+    if (x is None) != (y is None):
+        raise ValueError("Provide both x and y to position the scroll.")
+    if x is not None:
+        validate_coordinates(x, y)
+
+    pyautogui.scroll(clicks, x=x, y=y)
+    direction = "up" if clicks > 0 else "down"
+    return f"Scrolled {direction} by {abs(clicks)} clicks."
+
+
+def drag_mouse(start_x: int, start_y: int, end_x: int, end_y: int, duration=0.5):
+    """Drag the left mouse button between two screen coordinates."""
+    validate_coordinates(start_x, start_y)
+    validate_coordinates(end_x, end_y)
+    validate_duration(duration)
+
+    pyautogui.moveTo(start_x, start_y)
+    pyautogui.dragTo(end_x, end_y, duration=duration, button="left")
+    return f"Dragged from ({start_x}, {start_y}) to ({end_x}, {end_y})."
+
+
+def type_text(text: str, interval: float = 0.02):
+    """Type the given text."""
+    if not isinstance(text, str):
+        raise TypeError("Text must be a string.")
+    validate_duration(interval, maximum=1)
+    pyautogui.write(text, interval=interval)
+    return "Text typed successfully."
+
+
+def press_key(key: str):
+    """Press a keyboard key."""
+    if not isinstance(key, str):
+        raise TypeError("Key must be a string.")
+
+    key = key.lower()
+    if key not in pyautogui.KEYBOARD_KEYS:
+        raise ValueError(f"Unsupported keyboard key: {key}")
+    pyautogui.press(key)
+    return f"Pressed {key}."
+
+
+def press_hotkey(keys):
+    """Press a keyboard shortcut composed of two to four keys."""
+    if not isinstance(keys, list) or not 2 <= len(keys) <= 4:
+        raise ValueError("A shortcut must contain between 2 and 4 keys.")
+
+    normalized_keys = []
+    for key in keys:
+        if not isinstance(key, str):
+            raise TypeError("Shortcut keys must be strings.")
+        key = key.lower()
+        if key not in pyautogui.KEYBOARD_KEYS:
+            raise ValueError(f"Unsupported keyboard key: {key}")
+        normalized_keys.append(key)
+
+    pyautogui.hotkey(*normalized_keys)
+    return f"Pressed {'+'.join(normalized_keys)}."
+
+
+def select_all_and_replace_text(text: str):
+    """Select all text in the focused control and replace it."""
+    if not isinstance(text, str):
+        raise TypeError("Text must be a string.")
+
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.write(text, interval=0.02)
+    return "Selected content replaced."
+
+
+def take_screenshot():
+    """Capture the screen and save it."""
+    filename = f"jarvis_{int(time.time())}.png"
+    filepath = SCREENSHOT_DIR / filename
+    screenshot = pyautogui.screenshot()
+    screenshot.save(filepath)
+    return str(filepath)
+
+
+def open_notepad():
+    """Launch Windows Notepad."""
+    subprocess.Popen(["notepad.exe"])
+    time.sleep(2)
+    return "Notepad opened successfully."
+
+
+if __name__ == "__main__":
+    print("JARVIS COMPUTER CONTROL")
+    print("-----------------------")
+
+    print("Screen:", get_screen_size())
+
+    print(move_mouse(500, 400))
+
+    print("Taking screenshot...")
+    print(take_screenshot())
+
+    print("Computer control ready.")
+
+
+========== .\tools\screen.py ==========
+
+"""Local vision-based screen analysis for JARVIS."""
+
+import json
+
+import ollama
+
+from tools import computer
+
+VISION_MODEL = "qwen3-vl:4b"
+MAX_ELEMENTS = 20
+
+
+def _validate_analysis(content, screen_size):
+    try:
+        analysis = json.loads(content)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ValueError(f"Vision model returned invalid JSON: {error}") from error
+
+    if not isinstance(analysis, dict):
+        raise ValueError("Vision model response must be a JSON object.")
+
+    summary = analysis.get("screen_summary")
+    elements = analysis.get("elements")
+    if not isinstance(summary, str) or not isinstance(elements, list):
+        raise ValueError(
+            "Vision model response must include screen_summary and elements."
+        )
+    if len(elements) > MAX_ELEMENTS:
+        raise ValueError(f"Vision model returned more than {MAX_ELEMENTS} elements.")
+
+    width = screen_size["width"]
+    height = screen_size["height"]
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict):
+            raise ValueError(f"Element {index} must be a JSON object.")
+        if not isinstance(element.get("label"), str) or not isinstance(
+            element.get("role"), str
+        ):
+            raise ValueError(f"Element {index} must include label and role text.")
+        for coordinate, upper_bound in (("x", width), ("y", height)):
+            value = element.get(coordinate)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value < upper_bound
+            ):
+                raise ValueError(
+                    f"Element {index} has an invalid {coordinate} coordinate."
+                )
+    return analysis
+
+
+def analyze_screen():
+    """Capture the desktop and identify visible interface elements locally."""
+    screenshot_path = computer.take_screenshot()
+    response = ollama.chat(
+        model=VISION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Describe the visible screen and identify up to 20 useful "
+                    "visible interface elements. Return only JSON with this shape: "
+                    '{"screen_summary":"brief description","elements":'
+                    '[{"label":"visible label","role":"button, window, menu, '
+                    'text field, text, or other","x":123,"y":456}]}. '
+                    "Coordinates must be integer screen pixels at the center of "
+                    "each element. Include only clearly visible elements; do not "
+                    "guess missing labels or invent controls."
+                ),
+                "images": [screenshot_path],
+            }
+        ],
+        format="json",
+        options={"temperature": 0},
+    )
+    return _validate_analysis(
+        response.message.content,
+        computer.get_screen_size(),
+    )
+
+
+
+========== .\tools\terminal.py ==========
+
+"""Approval-gated developer command execution without a shell."""
+
+import math
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from tools.workspace import WORKSPACE
+
+ALLOWED_COMMANDS = frozenset({"python", "node", "npm", "npx", "git", "php"})
+IGNORED_CWD_PARTS = frozenset(
+    {".git", ".venv", "venv", "__pycache__", "node_modules", ".jarvis_backups"}
+)
+MAX_ARGUMENTS = 64
+MAX_ARGUMENT_LENGTH = 4096
+MAX_TIMEOUT_SECONDS = 300
+MAX_OUTPUT_SIZE = 12_000
+
+
+def _resolve_working_directory(cwd):
+    if not isinstance(cwd, str) or not cwd.strip():
+        raise ValueError("cwd must be a relative directory inside the workspace.")
+
+    requested = Path(cwd)
+    if requested.is_absolute():
+        raise ValueError("Absolute working directories are not allowed.")
+
+    workspace_root = WORKSPACE.resolve()
+    target = (workspace_root / requested).resolve()
+    try:
+        relative = target.relative_to(workspace_root)
+    except ValueError as error:
+        raise ValueError("Working directory must stay inside the workspace.") from error
+
+    if any(part.casefold() in IGNORED_CWD_PARTS for part in relative.parts):
+        raise ValueError("This working directory is restricted.")
+    if not target.is_dir():
+        raise NotADirectoryError(f"Working directory not found: {cwd}")
+
+    return target, str(relative) if relative.parts else "."
+
+
+def _resolve_executable(command):
+    if command == "python":
+        return [sys.executable]
+
+    executable = shutil.which(command)
+    if executable is None:
+        raise FileNotFoundError(f"Command is not installed or not on PATH: {command}")
+
+    if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
+        if command not in {"npm", "npx"}:
+            raise ValueError("Batch-file commands are disabled.")
+
+        node = shutil.which("node")
+        if node is None or Path(node).suffix.lower() in {".cmd", ".bat"}:
+            raise FileNotFoundError("A native Node.js executable is required.")
+
+        cli_name = f"{command}-cli.js"
+        npm_cli = (
+            Path(executable).parent
+            / "node_modules"
+            / "npm"
+            / "bin"
+            / cli_name
+        )
+        if not npm_cli.is_file():
+            raise FileNotFoundError(
+                f"Could not locate npm's native CLI script: {npm_cli}"
+            )
+        return [node, str(npm_cli)]
+
+    return [executable]
+
+
+def _truncate_output(output):
+    if len(output) <= MAX_OUTPUT_SIZE:
+        return output
+    return output[:MAX_OUTPUT_SIZE] + "\n[Output truncated]"
+
+
+def run_command(command, args, cwd=".", timeout=60):
+    """Run an approved development command in a workspace directory."""
+    if not isinstance(command, str) or command.lower() not in ALLOWED_COMMANDS:
+        raise ValueError(
+            f"Command must be one of: {', '.join(sorted(ALLOWED_COMMANDS))}."
+        )
+    command = command.lower()
+
+    if (
+        not isinstance(args, list)
+        or len(args) > MAX_ARGUMENTS
+        or any(
+            not isinstance(argument, str)
+            or "\0" in argument
+            or len(argument) > MAX_ARGUMENT_LENGTH
+            for argument in args
+        )
+    ):
+        raise ValueError(
+            f"args must be a list of at most {MAX_ARGUMENTS} strings, "
+            f"each no longer than {MAX_ARGUMENT_LENGTH} characters."
+        )
+
+    finite_timeout = False
+    if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+        try:
+            finite_timeout = math.isfinite(timeout)
+        except OverflowError:
+            pass
+
+    if not finite_timeout or timeout <= 0 or timeout > MAX_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"timeout must be between 0 and {MAX_TIMEOUT_SECONDS} seconds."
+        )
+
+    working_directory, relative_cwd = _resolve_working_directory(cwd)
+    executable = _resolve_executable(command)
+    result = subprocess.run(
+        [*executable, *args],
+        cwd=str(working_directory),
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
+
+    return {
+        "command": command,
+        "args": args,
+        "cwd": relative_cwd,
+        "exit_code": result.returncode,
+        "stdout": _truncate_output(result.stdout),
+        "stderr": _truncate_output(result.stderr),
+    }
+
+
+
+========== .\tools\workspace.py ==========
+
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parent.parent
+BACKUP_DIR = WORKSPACE / ".jarvis_backups"
+
+MAX_FILE_SIZE = 50_000
+MAX_OUTPUT_SIZE = 12_000
+TIMEOUT_SECONDS = 60
+
+IGNORED_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    ".jarvis_backups",
+    ".agent_backups",
+}
+
+
+def safe_path(filename):
+    """Resolve a path and prevent access outside the workspace."""
+    if not isinstance(filename, str) or not filename.strip():
+        raise ValueError("A valid filename is required.")
+
+    target = (WORKSPACE / filename).resolve()
+
+    try:
+        target.relative_to(WORKSPACE.resolve())
+    except ValueError:
+        raise ValueError("Access outside the JARVIS workspace is forbidden.")
+
+    if target == WORKSPACE:
+        raise ValueError("A filename is required, not the workspace root.")
+
+    if any(part in IGNORED_DIRS for part in target.relative_to(WORKSPACE).parts):
+        raise ValueError("Access to this directory is restricted.")
+
+    return target
+
+
+def list_files():
+    """List project files while excluding dependency and backup folders."""
+    files = []
+
+    for path in WORKSPACE.rglob("*"):
+        if not path.is_file():
+            continue
+
+        if any(part in IGNORED_DIRS for part in path.relative_to(WORKSPACE).parts):
+            continue
+
+        files.append(str(path.relative_to(WORKSPACE)))
+
+        if len(files) >= 200:
+            break
+
+    return files
+
+
+def read_file(filename):
+    """Read a project file."""
+    path = safe_path(filename)
+
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {filename}")
+
+    if path.stat().st_size > MAX_FILE_SIZE:
+        raise ValueError("File is too large to read.")
+
+    return path.read_text(encoding="utf-8")
+
+
+def backup_file(path):
+    """Back up an existing file before modifying it."""
+    if not path.exists():
+        return None
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    relative = path.relative_to(WORKSPACE)
+    backup_path = BACKUP_DIR / relative
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = backup_path.with_name(
+        f"{backup_path.stem}_{timestamp}{backup_path.suffix}"
+    )
+
+    shutil.copy2(path, backup_path)
+
+    return str(backup_path)
+
+
+def write_file(filename, content):
+    """Create or update a project file, backing up existing content."""
+    if not isinstance(content, str):
+        raise TypeError("File content must be text.")
+
+    if len(content.encode("utf-8")) > MAX_FILE_SIZE:
+        raise ValueError("File content exceeds the size limit.")
+
+    path = safe_path(filename)
+
+    if path.exists() and not path.is_file():
+        raise ValueError("Target must be a file.")
+
+    backup = backup_file(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+    return {
+        "message": f"File saved: {filename}",
+        "backup": backup,
+    }
+
+
+def run_python_file(filename):
+    """Execute a Python file inside the workspace."""
+    path = safe_path(filename)
+
+    if path.suffix.lower() != ".py":
+        raise ValueError("Only Python files can be executed by this tool.")
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Python file not found: {filename}")
+
+    result = subprocess.run(
+        [sys.executable, str(path)],
+        cwd=str(WORKSPACE),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT_SECONDS,
+        errors="replace",
+    )
+
+    output = (
+        f"Exit code: {result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\n"
+        f"STDERR:\n{result.stderr}"
+    )
+
+    if len(output) > MAX_OUTPUT_SIZE:
+        output = output[:MAX_OUTPUT_SIZE] + "\n[Output truncated]"
+
+    return output
+
+
+if __name__ == "__main__":
+    print("JARVIS WORKSPACE TOOLS")
+    print("----------------------")
+    print("Workspace:", WORKSPACE)
+    print("\nProject files:")
+
+    for filename in list_files():
+        print("-", filename)
+
