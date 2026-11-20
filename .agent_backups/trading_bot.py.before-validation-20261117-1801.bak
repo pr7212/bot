@@ -1,0 +1,175 @@
+"""Simple terminal-based trading simulator.
+
+Run with:
+    python trading_bot.py
+    python trading_bot.py --cash 10000 --prices AAPL=180.50,MSFT=410.25,GOOG=270.80
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Tuple
+
+
+@dataclass
+class Position:
+    symbol: str
+    shares: int = 0
+    avg_price: float = 0.0
+
+    def market_value(self, price: float) -> float:
+        return self.shares * price
+
+    def __str__(self) -> str:
+        return f"{self.symbol}: {self.shares} shares @ ${self.avg_price:.2f}"
+
+
+class TradingBot:
+    def __init__(self, cash: float = 10_000.0):
+        self.cash = float(cash)
+        self.positions: Dict[str, Position] = {}
+        self.trade_history: List[str] = []
+
+    def buy(self, symbol: str, shares: int, price: float) -> str:
+        symbol = symbol.upper()
+        if shares <= 0:
+            raise ValueError("Shares must be greater than zero.")
+        if price <= 0:
+            raise ValueError("Price must be greater than zero.")
+
+        cost = shares * price
+        if cost > self.cash:
+            raise ValueError(
+                f"Not enough cash. Need ${cost:.2f}, but only ${self.cash:.2f} available."
+            )
+
+        existing = self.positions.get(symbol)
+        if existing is None:
+            self.positions[symbol] = Position(symbol=symbol, shares=shares, avg_price=price)
+        else:
+            total_shares = existing.shares + shares
+            total_cost = (existing.shares * existing.avg_price) + cost
+            existing.shares = total_shares
+            existing.avg_price = total_cost / total_shares
+
+        self.cash -= cost
+        message = f"Bought {shares} shares of {symbol} at ${price:.2f}."
+        self.trade_history.append(message)
+        return message
+
+    def sell(self, symbol: str, shares: int, price: float) -> str:
+        symbol = symbol.upper()
+        if shares <= 0:
+            raise ValueError("Shares must be greater than zero.")
+
+        existing = self.positions.get(symbol)
+        if existing is None or existing.shares < shares:
+            raise ValueError(f"Not enough shares of {symbol} to sell.")
+
+        proceeds = shares * price
+        self.cash += proceeds
+        existing.shares -= shares
+
+        if existing.shares == 0:
+            del self.positions[symbol]
+
+        message = f"Sold {shares} shares of {symbol} at ${price:.2f}."
+        self.trade_history.append(message)
+        return message
+
+    def portfolio_value(self, prices: Dict[str, float]) -> float:
+        total = self.cash
+        for symbol, position in self.positions.items():
+            price = prices.get(symbol, 0.0)
+            total += position.market_value(price)
+        return total
+
+    def summary(self, prices: Dict[str, float]) -> str:
+        lines = [
+            "=== Portfolio Summary ===",
+            f"Cash: ${self.cash:.2f}",
+            f"Net worth: ${self.portfolio_value(prices):.2f}",
+        ]
+
+        if not self.positions:
+            lines.append("No open positions.")
+            return "\n".join(lines)
+
+        lines.append("Positions:")
+        for symbol, position in sorted(self.positions.items()):
+            price = prices.get(symbol, 0.0)
+            market_value = position.market_value(price)
+            lines.append(
+                f"- {symbol}: {position.shares} shares @ ${position.avg_price:.2f} "
+                f"(market ${price:.2f}, value ${market_value:.2f})"
+            )
+
+        return "\n".join(lines)
+
+    def recent_trades(self, limit: int = 5) -> str:
+        if not self.trade_history:
+            return "No trades yet."
+        return "\n".join(self.trade_history[-limit:])
+
+
+def parse_price_map(raw: str) -> Dict[str, float]:
+    if not raw:
+        return {}
+
+    prices: Dict[str, float] = {}
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        symbol, value = item.split("=", 1)
+        prices[symbol.strip().upper()] = float(value.strip())
+    return prices
+
+
+def demo_run() -> TradingBot:
+    bot = TradingBot(10_000)
+    prices = {"AAPL": 185.25, "MSFT": 410.75, "NVDA": 118.60, "GOOG": 272.10}
+
+    bot.buy("AAPL", 10, prices["AAPL"])
+    bot.buy("MSFT", 5, prices["MSFT"])
+    bot.sell("AAPL", 3, prices["AAPL"] * 1.03)
+    bot.buy("NVDA", 20, prices["NVDA"])
+
+    print("=== Trading Bot Demo ===")
+    print(bot.summary(prices))
+    print("\nRecent trades:")
+    print(bot.recent_trades())
+    return bot
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Simple terminal trading bot")
+    parser.add_argument("--cash", type=float, default=10_000.0, help="Starting cash")
+    parser.add_argument(
+        "--prices",
+        type=str,
+        default="AAPL=185.25,MSFT=410.75,NVDA=118.60,GOOG=272.10",
+        help="Comma-separated symbol=price pairs",
+    )
+    parser.add_argument("--buy", nargs=3, metavar=("SYMBOL", "SHARES", "PRICE"), help="Buy shares")
+    parser.add_argument("--sell", nargs=3, metavar=("SYMBOL", "SHARES", "PRICE"), help="Sell shares")
+    args = parser.parse_args()
+
+    bot = TradingBot(args.cash)
+    prices = parse_price_map(args.prices)
+
+    if args.buy:
+        symbol, shares, price = args.buy
+        print(bot.buy(symbol, int(shares), float(price)))
+    elif args.sell:
+        symbol, shares, price = args.sell
+        print(bot.sell(symbol, int(shares), float(price)))
+    else:
+        demo_run()
+        return
+
+    print(bot.summary(prices))
+
+
+if __name__ == "__main__":
+    main()
