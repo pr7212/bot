@@ -6,6 +6,16 @@ import jarvis
 
 
 class JarvisDesktopActionTests(unittest.TestCase):
+    def setUp(self):
+        self.desktop_control = patch("jarvis.ENABLE_DESKTOP_CONTROL", True)
+        self.auto_plan = patch("jarvis.AUTO_PLAN", False)
+        self.desktop_control.start()
+        self.auto_plan.start()
+
+    def tearDown(self):
+        self.auto_plan.stop()
+        self.desktop_control.stop()
+
     @staticmethod
     def tool_call(name, arguments):
         return SimpleNamespace(

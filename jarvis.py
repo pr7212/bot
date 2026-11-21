@@ -45,7 +45,7 @@ AUTO_PLAN = True                # one thinking-enabled planning call per task
 # Approval policy. Desktop actions ALWAYS require approval.
 AUTO_APPROVE_FILE_CHANGES = True      # git checkpoints are the undo
 AUTO_APPROVE_COMMANDS = False         # flip to True only inside a dedicated VM
-CONFIRM_MEMORY_WRITES = False         # True = review every note/task write
+CONFIRM_MEMORY_WRITES = True          # review every note and task write
 
 # Real mouse/keyboard control must be enabled explicitly:
 # PowerShell: $env:JARVIS_ENABLE_DESKTOP="1"
@@ -610,7 +610,22 @@ def validate_args(name, arguments):
 # TOOL EXECUTION
 # ==========================================
 
-def execute_tool(name, arguments):
+def execute_tool(name, arguments=None):
+    """Run one tool.
+
+    Accepts either execute_tool(name, arguments) or execute_tool(tool_call),
+    where tool_call.function has name and arguments.
+    """
+    if not isinstance(name, str):
+        tool_call = name
+        name = tool_call.function.name
+        arguments, arg_error = parse_arguments(tool_call)
+
+        if arg_error:
+            return arg_error
+    elif arguments is None:
+        arguments = {}
+
     function = AVAILABLE_FUNCTIONS.get(name)
 
     if function is None:
