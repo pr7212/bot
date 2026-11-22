@@ -14,7 +14,7 @@ from tools import computer, screen, terminal, workspace
 
 try:
     import pyautogui
-    pyautogui.FAILSAFE = True   # slam the mouse into a corner to abort
+    pyautogui.FAILSAFE = True
 except Exception:
     pass
 
@@ -26,29 +26,27 @@ except Exception:
 MODEL = "qwen3:8b"
 KEEP_ALIVE = "10m"
 
-NUM_CTX = 16384            # raise if your VRAM allows
+NUM_CTX = 16384
 NUM_PREDICT = 3000
 
 MAX_STEPS = 30
 MAX_TOOL_CALLS = 80
-MAX_OUTPUT_CHARS = 8_000        # tool output the model sees
-MAX_OBSERVATION_CHARS = 3_000   # screen-analysis JSON the model sees
-MAX_HISTORY_CHARS = 36_000      # old tool output is squeezed past this
+MAX_OUTPUT_CHARS = 8_000
+MAX_OBSERVATION_CHARS = 3_000
+MAX_HISTORY_CHARS = 36_000
 MAX_TIMEOUT = 120
 
-MAX_REPEATED_CALLS = 3          # identical call, nothing changed in between
-MAX_VERIFY_NAGS = 2             # times "done" is rejected without a passing run
+MAX_REPEATED_CALLS = 3
+MAX_REPEATED_HARD_STOP = 6          # FIX #1.5: separate soft block from hard stop
+MAX_VERIFY_NAGS = 2
 
 DEBUG = False
-AUTO_PLAN = True                # one thinking-enabled planning call per task
+AUTO_PLAN = True
 
-# Approval policy. Desktop actions ALWAYS require approval.
-AUTO_APPROVE_FILE_CHANGES = True      # git checkpoints are the undo
-AUTO_APPROVE_COMMANDS = False         # flip to True only inside a dedicated VM
-CONFIRM_MEMORY_WRITES = True          # review every note and task write
+AUTO_APPROVE_FILE_CHANGES = True
+AUTO_APPROVE_COMMANDS = False
+CONFIRM_MEMORY_WRITES = True
 
-# Real mouse/keyboard control must be enabled explicitly:
-# PowerShell: $env:JARVIS_ENABLE_DESKTOP="1"
 ENABLE_DESKTOP_CONTROL = os.getenv("JARVIS_ENABLE_DESKTOP", "0") == "1"
 
 WORKSPACE_DIR = Path(workspace.WORKSPACE).resolve()
@@ -56,6 +54,12 @@ PLAN_FILE = WORKSPACE_DIR / "PLAN.md"
 STOP_FILE = WORKSPACE_DIR / ".jarvis_stop"
 
 ALLOWED_COMMANDS = {"python", "node", "npm", "npx", "git", "php"}
+
+# FIX #1.3: sentinel prefix so we never sniff content for errors.
+ERROR_PREFIX = "Tool execution failed"
+
+# FIX #1.7: UUID-ish marker unlikely to collide with tool output.
+OBS_MARKER = "<<<JARVIS_SCREEN_OBS>>>"
 
 
 # ==========================================
@@ -69,14 +73,20 @@ ES_DISPLAY_REQUIRED = 0x00000002
 
 def keep_awake():
     if os.name == "nt":
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
-        )
+        try:
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            )
+        except Exception:
+            pass
 
 
 def allow_sleep():
     if os.name == "nt":
-        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        try:
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        except Exception:
+            pass
 
 
 # ==========================================
@@ -84,7 +94,6 @@ def allow_sleep():
 # ==========================================
 
 def clip(text, limit=MAX_OUTPUT_CHARS):
-    """Truncate long output but keep the tail, where errors usually are."""
     text = str(text)
 
     if len(text) <= limit:
@@ -118,19 +127,17 @@ def check_stop():
 
 
 def is_error(result):
-    return str(result).startswith((
-        "Tool execution failed",
-        "Action denied",
-        "Invalid",
-        "Bad arguments",
-        "Error",
-        "Desktop control is disabled",
-        "Command not allowed",
-    ))
+    # FIX #1.3: only the sentinel counts as an error.
+    return isinstance(result, str) and result.startswith(ERROR_PREFIX)
+
+
+def error(message):
+    # FIX #1.3: helper that produces sentinel-prefixed errors.
+    return f"{ERROR_PREFIX}: {message}"
 
 
 # ==========================================
-# GIT CHECKPOINTS (undo for everything)
+# GIT CHECKPOINTS
 # ==========================================
 
 GIT = shutil.which("git")
@@ -163,12 +170,11 @@ def init_git():
                 ".agent_backups/\n.jarvis_stop\n*.tmp\n",
                 encoding="utf-8",
             )
-    except Exception as error:
-        print(f"WARNING: git setup failed: {error}")
+    except Exception as exc:
+        print(f"WARNING: git setup failed: {exc}")
 
 
 def checkpoint(message):
-    """Commit everything if anything changed. Never raises."""
     if not GIT:
         return
 
@@ -183,8 +189,8 @@ def checkpoint(message):
             "-c", "user.email=jarvis@localhost",
             "commit", "-m", f"jarvis: {message}",
         )
-    except Exception as error:
-        print(f"(checkpoint failed: {error})")
+    except Exception as exc:
+        print(f"(checkpoint failed: {exc})")
 
 
 # ==========================================
@@ -220,8 +226,6 @@ def list_tasks(outstanding_only=False, limit=20):
 
 
 def build_memory_context():
-    """Load saved state into the system prompt so the model never has to
-    remember to ask for it."""
     try:
         with MemoryStore() as memory:
             tasks = memory.list_tasks(True, 10)
@@ -234,9 +238,9 @@ def build_memory_context():
             + clip(json.dumps(notes, ensure_ascii=False, default=str), 2000)
             + "\n"
         )
-    except Exception as error:
+    except Exception as exc:
         if DEBUG:
-            print(f"[JARVIS DEBUG] Memory context unavailable: {error}")
+            print(f"[JARVIS DEBUG] Memory context unavailable: {exc}")
         return ""
 
 
@@ -245,7 +249,6 @@ def build_memory_context():
 # ==========================================
 
 def edit_file(filename, old, new):
-    """Replace one exact snippet. Safer than rewriting a whole file."""
     if not isinstance(old, str) or not old:
         raise ValueError("'old' must be a non-empty string.")
 
@@ -311,8 +314,6 @@ AVAILABLE_FUNCTIONS = {
     "list_tasks": list_tasks,
 }
 
-# Actions that change the real desktop: always need approval,
-# and are followed by a screen observation.
 DESKTOP_ACTIONS = {
     "open_notepad",
     "type_text",
@@ -326,7 +327,6 @@ DESKTOP_ACTIONS = {
     "drag_mouse",
 }
 
-# Everything that touches the real desktop at all (needs the enable flag).
 DESKTOP_TOOLS = DESKTOP_ACTIONS | {
     "move_mouse",
     "get_screen_size",
@@ -570,6 +570,17 @@ SCHEMAS = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
 # ARGUMENT PARSING AND VALIDATION
 # ==========================================
 
+# FIX #1.8: enforce types declared in schema.
+_TYPES = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
 def parse_arguments(tool_call):
     """Return (arguments_dict, error_message_or_None)."""
     name = tool_call.function.name
@@ -578,11 +589,14 @@ def parse_arguments(tool_call):
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments)
-        except json.JSONDecodeError as error:
-            return {}, f"Invalid JSON arguments for '{name}': {error}"
+        except json.JSONDecodeError as exc:
+            return {}, error(f"Invalid JSON arguments for '{name}': {exc}")
 
     if not isinstance(arguments, dict):
-        return {}, f"Invalid arguments for '{name}': expected an object."
+        return {}, error(
+            f"Invalid arguments for '{name}': expected an object, "
+            f"got {type(arguments).__name__}."
+        )
 
     return arguments, None
 
@@ -593,17 +607,57 @@ def validate_args(name, arguments):
     if schema is None:
         return None
 
-    missing = [k for k in schema["required"] if k not in arguments]
-    unknown = [k for k in arguments if k not in schema["properties"]]
+    required = schema.get("required", [])
+    properties = schema.get("properties", {})
+
+    missing = [k for k in required if k not in arguments]
+    unknown = [k for k in arguments if k not in properties]
 
     if missing or unknown:
-        allowed = list(schema["properties"])
+        allowed = list(properties)
         return (
             f"Bad arguments for {name}. Missing: {missing}. "
             f"Unknown: {unknown}. Allowed arguments: {allowed}."
         )
 
+    for key, value in arguments.items():
+        declared = properties[key].get("type")
+        expected = _TYPES.get(declared)
+
+        if expected is None:
+            continue
+
+        # bool is a subclass of int; special-case it.
+        if declared == "integer" and isinstance(value, bool):
+            return f"Bad arguments for {name}: '{key}' must be integer, got boolean."
+
+        if not isinstance(value, expected):
+            return (
+                f"Bad arguments for {name}: '{key}' must be "
+                f"{declared}, got {type(value).__name__}."
+            )
+
     return None
+
+
+def _in_workspace(path_value):
+    """Resolve a workspace-relative (or absolute) path and confirm it stays
+    inside WORKSPACE_DIR. Returns the resolved string, or raises ValueError."""
+    candidate = Path(path_value)
+
+    if not candidate.is_absolute():
+        candidate = WORKSPACE_DIR / candidate
+
+    resolved = candidate.resolve()
+
+    try:
+        resolved.relative_to(WORKSPACE_DIR)
+    except ValueError:
+        raise ValueError(
+            f"Path '{path_value}' is outside the workspace."
+        )
+
+    return str(resolved)
 
 
 # ==========================================
@@ -611,11 +665,7 @@ def validate_args(name, arguments):
 # ==========================================
 
 def execute_tool(name, arguments=None):
-    """Run one tool.
-
-    Accepts either execute_tool(name, arguments) or execute_tool(tool_call),
-    where tool_call.function has name and arguments.
-    """
+    """Execute one tool by name. Also accepts a single ToolCall object."""
     if not isinstance(name, str):
         tool_call = name
         name = tool_call.function.name
@@ -626,13 +676,16 @@ def execute_tool(name, arguments=None):
     elif arguments is None:
         arguments = {}
 
+    if not isinstance(arguments, dict):
+        return error(f"Invalid arguments for '{name}'.")
+
     function = AVAILABLE_FUNCTIONS.get(name)
 
     if function is None:
-        return f"Error: This tool is not available: '{name}'."
+        return error(f"This tool is not available: '{name}'.")
 
     if name in DESKTOP_TOOLS and not ENABLE_DESKTOP_CONTROL:
-        return (
+        return error(
             "Desktop control is disabled. Tell the user to set "
             "JARVIS_ENABLE_DESKTOP=1 and restart JARVIS. "
             "Use file and terminal tools instead."
@@ -641,22 +694,29 @@ def execute_tool(name, arguments=None):
     problem = validate_args(name, arguments)
 
     if problem:
-        return problem
+        return error(problem)
 
     arguments = dict(arguments)
 
     # --- command safety -------------------------------------------------
     if name == "run_command":
-        if arguments["command"] not in ALLOWED_COMMANDS:
-            return (
+        if arguments.get("command") not in ALLOWED_COMMANDS:
+            return error(
                 "Command not allowed. Allowed: "
                 + ", ".join(sorted(ALLOWED_COMMANDS))
             )
 
-        if not isinstance(arguments["args"], list) or not all(
+        if not isinstance(arguments.get("args"), list) or not all(
             isinstance(a, str) for a in arguments["args"]
         ):
-            return "Invalid arguments: 'args' must be a list of strings."
+            return error("Invalid arguments: 'args' must be a list of strings.")
+
+        # FIX #2.8: sandbox cwd.
+        if "cwd" in arguments and arguments["cwd"]:
+            try:
+                arguments["cwd"] = _in_workspace(arguments["cwd"])
+            except (ValueError, OSError) as exc:
+                return error(f"Invalid 'cwd': {exc}")
 
         if "timeout" in arguments:
             try:
@@ -672,11 +732,13 @@ def execute_tool(name, arguments=None):
         print("Arguments:", clip(arguments, 1500))
 
         if not approve(""):
-            return "Action denied by user."
+            return error(
+                "Action denied by user. Do not retry this action; "
+                "ask the user how to proceed instead."
+            )
 
     # --- reversibility --------------------------------------------------
     if name == "write_file":
-        # Commit the previous state so any overwrite can be undone.
         checkpoint(f"before writing {arguments.get('filename')}")
 
     # --- run ------------------------------------------------------------
@@ -686,10 +748,10 @@ def execute_tool(name, arguments=None):
         print("[JARVIS TOOL] Result:", clip(result, 1500))
     except KeyboardInterrupt:
         raise
-    except Exception as error:
-        message = f"{type(error).__name__}: {error}"
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
         print("[JARVIS TOOL ERROR]", message)
-        return f"Tool execution failed: {message}"
+        return error(message)
 
     # --- observe the screen after real desktop actions ------------------
     if name in DESKTOP_ACTIONS:
@@ -700,11 +762,11 @@ def execute_tool(name, arguments=None):
                 MAX_OBSERVATION_CHARS,
             )
             return f"{result}{OBS_MARKER} {observation_text}"
-        except Exception as error:
-            message = f"{type(error).__name__}: {error}"
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
             print("[JARVIS OBSERVATION ERROR]", message)
             return (
-                f"Action completed: {result}\n"
+                f"{result}\n"
                 f"Screen observation failed: {message}"
             )
 
@@ -719,41 +781,46 @@ def execute_tool(name, arguments=None):
 # ==========================================
 
 def command_succeeded(result):
-    """
-    Decide whether a run result means success.
-    Adjust the key names to match what terminal.run_command and
-    workspace.run_python_file actually return.
-    """
-    result = str(result)
+    """Decide whether a run result means success.
 
-    if is_error(result):
+    Preferred: run_command/run_python_file return a JSON-serializable dict
+    with one of {returncode, return_code, exit_code, exitcode} or
+    {success, ok}, plus optionally timed_out/timeout.
+    """
+    text = str(result)
+
+    if is_error(text):
         return False
 
+    data = None
     try:
-        data = json.loads(result)
-    except ValueError:
-        match = re.search(r"exit[ _-]?code\W+(-?\d+)", result, re.I)
-        return bool(match) and match.group(1) == "0"
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        data = None
 
-    if not isinstance(data, dict):
+    if isinstance(data, dict):
+        if data.get("timed_out") or data.get("timeout"):
+            return False
+
+        for key in ("returncode", "return_code", "exit_code", "exitcode"):
+            if key in data:
+                return data[key] == 0
+
+        for key in ("success", "ok"):
+            if key in data:
+                return bool(data[key])
+
         return False
 
-    if data.get("timed_out") or data.get("timeout"):
-        return False
-
-    for key in ("returncode", "return_code", "exit_code", "exitcode"):
-        if key in data:
-            return data[key] == 0
-
-    for key in ("success", "ok"):
-        if key in data:
-            return bool(data[key])
+    # Fallback for plain-text results: look for an exit code line.
+    match = re.search(r"exit[ _-]?code\W+(-?\d+)", text, re.I)
+    if match:
+        return match.group(1) == "0"
 
     return False
 
 
 def counts_as_verification(name, arguments):
-    """Only runs that really exercise the code can clear the dirty flag."""
     if name == "run_python_file":
         return True
 
@@ -778,9 +845,6 @@ def counts_as_verification(name, arguments):
 # CONTEXT MANAGEMENT
 # ==========================================
 
-OBS_MARKER = "\nScreen after action:"
-
-
 def message_size(message):
     if isinstance(message, dict):
         return len(str(message.get("content", "")))
@@ -791,7 +855,7 @@ def message_size(message):
 
 
 def compact_history(messages, keep_recent=6):
-    # 1. Only the newest screen observation is useful; drop the others.
+    # 1. Only the newest screen observation is kept.
     observation_indexes = [
         i for i, m in enumerate(messages)
         if isinstance(m, dict)
@@ -805,33 +869,53 @@ def compact_history(messages, keep_recent=6):
             content.split(OBS_MARKER)[0] + "\n[old screen observation removed]"
         )
 
-    # 2. If still too long, squeeze old tool output.
-    if sum(message_size(m) for m in messages) <= MAX_HISTORY_CHARS:
+    # FIX #1.6: O(n) instead of O(n^2). Compute sizes once.
+    sizes = [message_size(m) for m in messages]
+    total = sum(sizes)
+
+    if total <= MAX_HISTORY_CHARS:
         return
 
     cutoff = len(messages) - keep_recent
 
     for index, message in enumerate(messages):
+        if total <= MAX_HISTORY_CHARS:
+            break
+
         if index < 2 or index >= cutoff:
             continue
 
         if isinstance(message, dict) and message.get("role") == "tool":
-            content = str(message.get("content", ""))
+            old = str(message.get("content", ""))
 
-            if len(content) > 600:
-                message["content"] = (
-                    content[:250]
+            if len(old) > 600:
+                new = (
+                    old[:250]
                     + "\n...[old output removed to save context]...\n"
-                    + content[-250:]
+                    + old[-250:]
                 )
-
-        if sum(message_size(m) for m in messages) <= MAX_HISTORY_CHARS:
-            break
+                total -= len(old) - len(new)
+                message["content"] = new
 
 
 # ==========================================
-# PLAN FILE (resumable work)
+# PLAN FILE
 # ==========================================
+
+# FIX #1.13: cheap heuristic so trivial requests skip planning.
+_PLAN_TRIGGERS = (
+    "write", "build", "implement", "create", "refactor", "fix", "add",
+    "make", "update", "delete", "remove", "test", "migrate", "install",
+    "debug", "rename", "convert", "generate", "script", "project",
+)
+
+
+def looks_like_a_task(instruction):
+    low = instruction.lower().strip()
+    if len(low) > 40:
+        return True
+    return any(trigger in low for trigger in _PLAN_TRIGGERS)
+
 
 def plan_has_open_items():
     if not PLAN_FILE.exists():
@@ -846,7 +930,6 @@ def archive_plan():
 
 
 def generate_plan(instruction):
-    """One thinking-enabled call that produces a short checklist."""
     print("\nJARVIS is planning...")
 
     try:
@@ -889,8 +972,8 @@ def generate_plan(instruction):
         print(text)
         return text
 
-    except Exception as error:
-        print(f"(planning skipped: {type(error).__name__}: {error})")
+    except Exception as exc:
+        print(f"(planning skipped: {type(exc).__name__}: {exc})")
         return None
 
 
@@ -949,8 +1032,17 @@ RULES:
 # AGENT LOOP
 # ==========================================
 
+def _assistant_dict(message):
+    """Normalize the assistant message into a dict so it survives any
+    future compaction or serialization round-trips safely."""
+    return {
+        "role": "assistant",
+        "content": message.content or "",
+        "tool_calls": message.tool_calls or [],
+    }
+
+
 def ask_jarvis(user_input, max_steps=MAX_STEPS):
-    # ---- plan handling ---------------------------------------------------
     plan_text = None
 
     if plan_has_open_items():
@@ -962,7 +1054,7 @@ def ask_jarvis(user_input, max_steps=MAX_STEPS):
         else:
             archive_plan()
 
-    if plan_text is None and AUTO_PLAN:
+    if plan_text is None and AUTO_PLAN and looks_like_a_task(user_input):
         plan_text = generate_plan(user_input)
 
     system_content = SYSTEM_PROMPT + build_memory_context()
@@ -978,12 +1070,11 @@ def ask_jarvis(user_input, max_steps=MAX_STEPS):
         {"role": "user", "content": user_input},
     ]
 
-    # ---- loop state ------------------------------------------------------
     total_calls = 0
-    dirty = False            # files changed since the last passing run
+    dirty = False
     nags = 0
-    change_counter = 0       # bumps whenever a project file changes
-    call_counts = {}         # (name, args, change_counter) -> repeats
+    change_counter = 0
+    call_counts = {}
 
     for step in range(1, max_steps + 1):
 
@@ -1008,13 +1099,16 @@ def ask_jarvis(user_input, max_steps=MAX_STEPS):
                     "num_predict": NUM_PREDICT,
                 },
             )
-        except Exception as error:
-            print(f"\n[JARVIS ERROR] {type(error).__name__}: {error}")
-            print("Is Ollama running, and is the model pulled?")
+        except Exception as exc:
+            print(f"\n[JARVIS ERROR] {type(exc).__name__}: {exc}")
+            print(
+                "Common causes: Ollama server not running, model not pulled, "
+                "or not enough VRAM for num_ctx. Try: ollama list, ollama ps"
+            )
             return None
 
         message = response.message
-        messages.append(message)
+        messages.append(_assistant_dict(message))
 
         if DEBUG:
             print(f"[JARVIS DEBUG] Tool calls: {message.tool_calls}")
@@ -1048,168 +1142,4 @@ def ask_jarvis(user_input, max_steps=MAX_STEPS):
             checkpoint("final state")
             return final
 
-        # ---- execute tool calls -----------------------------------------
-        files_changed_this_step = False
-        desktop_action_seen = False
-
-        for call in tool_calls:
-
-            check_stop()
-
-            total_calls += 1
-
-            if total_calls > MAX_TOOL_CALLS:
-                print("\n[JARVIS] Maximum tool-call limit reached.")
-                checkpoint("stopped at tool-call limit")
-                return None
-
-            name = call.function.name
-            arguments, arg_error = parse_arguments(call)
-
-            if arg_error:
-                result = arg_error
-
-            elif name in DESKTOP_ACTIONS and desktop_action_seen:
-                result = (
-                    "Action deferred: review the previous action's screen "
-                    "observation before requesting another desktop action."
-                )
-
-            else:
-                # Loop detection: identical call, nothing changed in between.
-                key = (
-                    name,
-                    json.dumps(arguments, sort_keys=True, default=str),
-                    change_counter,
-                )
-                call_counts[key] = call_counts.get(key, 0) + 1
-                repeats = call_counts[key]
-
-                if repeats > MAX_REPEATED_CALLS + 2:
-                    print("\n[JARVIS] Stuck repeating the same call. Stopping.")
-                    checkpoint("stopped: repeated calls")
-                    return None
-
-                if repeats > MAX_REPEATED_CALLS:
-                    result = (
-                        "Repeated call blocked: you already made this exact "
-                        "call and nothing has changed since. Try a different "
-                        "approach: re-read the file, change the code, or "
-                        "change the command."
-                    )
-                else:
-                    result = execute_tool(name, arguments)
-
-                    if name in DESKTOP_ACTIONS and not is_error(result):
-                        desktop_action_seen = True
-
-            raw_result = str(result)
-
-            # Track changes and verification using the UNCLIPPED result.
-            if name in FILE_CHANGE_TOOLS and not is_error(raw_result):
-                if arguments.get("filename") != "PLAN.md":
-                    dirty = True
-                    change_counter += 1
-                    files_changed_this_step = True
-
-            elif counts_as_verification(name, arguments):
-                if command_succeeded(raw_result):
-                    dirty = False
-
-            messages.append({
-                "role": "tool",
-                "tool_name": name,
-                "content": clip(raw_result),
-            })
-
-        if files_changed_this_step:
-            checkpoint(f"step {step}")
-
-    print("\n[JARVIS] Maximum tool-call steps reached.")
-    print("Progress is saved in PLAN.md. Say 'continue' to resume.")
-    checkpoint("stopped at step limit")
-    return None
-
-
-# ==========================================
-# ENTRY POINT
-# ==========================================
-
-def main():
-    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-    init_git()
-
-    print("=" * 45)
-    print("          JARVIS AI ASSISTANT")
-    print("=" * 45)
-    print("Model:", MODEL)
-    print("Workspace:", workspace.WORKSPACE)
-    print("Context window:", NUM_CTX)
-    print("Desktop control:", ENABLE_DESKTOP_CONTROL)
-    print("Automatic file changes:", AUTO_APPROVE_FILE_CHANGES)
-    print("Automatic commands:", AUTO_APPROVE_COMMANDS)
-    print("Git checkpoints:", bool(GIT))
-
-    print("\nCommands:")
-    print("/exit      - Close JARVIS")
-    print("/stop      - Create emergency stop signal (between tasks)")
-    print("/resume    - Clear emergency stop signal")
-    print("/newplan   - Archive the current PLAN.md")
-    print("\nDuring a task: press Ctrl+C, or create the file "
-          f"{STOP_FILE.name} in the workspace from another terminal.")
-
-    while True:
-        try:
-            user_input = input("\nYou: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        command = user_input.lower()
-
-        if not user_input:
-            continue
-
-        if command in {"exit", "quit", "/exit"}:
-            break
-
-        if command == "/stop":
-            STOP_FILE.touch()
-            print("Emergency stop signal created.")
-            continue
-
-        if command == "/resume":
-            if STOP_FILE.exists():
-                STOP_FILE.unlink()
-            print("Stop signal cleared.")
-            continue
-
-        if command == "/newplan":
-            archive_plan()
-            print("Plan archived to PLAN.old.md.")
-            continue
-
-        if STOP_FILE.exists():
-            print("JARVIS is stopped. Type /resume to continue.")
-            continue
-
-        keep_awake()
-
-        try:
-            ask_jarvis(user_input)
-
-        except KeyboardInterrupt:
-            print("\n[JARVIS] Interrupted.")
-            checkpoint("interrupted")
-
-        except Exception as error:
-            print(f"\n[JARVIS ERROR] {type(error).__name__}: {error}")
-
-        finally:
-            allow_sleep()
-
-    print("JARVIS stopped.")
-
-
-if __name__ == "__main__":
-    main()
+        # ---- execute tool
